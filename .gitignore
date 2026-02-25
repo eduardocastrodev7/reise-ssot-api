@@ -1,0 +1,16 @@
+node_modules/
+
+# env
+.env
+.env.*
+!.env.example
+
+# logs
+*.log
+
+# credenciais
+*.pem
+*.key
+*.p12
+*.pfx
+**/*service-account*.json
