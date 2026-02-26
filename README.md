@@ -1,4 +1,4 @@
-# Reise SSOT API — Cloud Run (Fastify + BigQuery)
+# Reise SSOT API - Cloud Run (Fastify + BigQuery)
 
 API HTTP usada pelo Dashboard Gerencial da Reise para consultar o **SSOT no BigQuery (US)** com segurança e governança.
 
