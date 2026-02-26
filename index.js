@@ -125,7 +125,7 @@ channels_period AS (
     SAFE_DIVIDE(SUM(CAST(vendas AS FLOAT64)), NULLIF(SUM(CAST(pedidos AS INT64)), 0)) AS aov,
     SUM(CAST(pedidos_novos_clientes AS INT64)) AS pedidos_novos_clientes,
     SUM(CAST(pedidos_clientes_recorrentes AS INT64)) AS pedidos_clientes_recorrentes
-  FROM \`${BQ_PROJECT}.${BQ_DATASET}.shopify_channels_daily_complete_v\`
+  FROM \`${BQ_PROJECT}.${BQ_DATASET}.shopify_channels_daily_dashboard_v\`
   WHERE data BETWEEN @start_date AND @end_date
   GROUP BY canal, tipo
 )
