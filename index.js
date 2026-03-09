@@ -16,10 +16,10 @@ const TTL_INTRADAY_SECONDS = Number(process.env.TTL_INTRADAY_SECONDS || 300); //
 const TTL_CLOSED_SECONDS = Number(process.env.TTL_CLOSED_SECONDS || 3600);    // 60 min
 const MAX_RANGE_DAYS = Number(process.env.MAX_RANGE_DAYS || 400);
 
-// Proteção simples contra surpresa
+// Proteção simples
 const MAX_BYTES_BILLED = process.env.MAX_BYTES_BILLED
   ? Number(process.env.MAX_BYTES_BILLED)
-  : 5 * 1024 * 1024 * 1024; // 5GB por query (bem acima do MVP)
+  : 5 * 1024 * 1024 * 1024; // 5GB
 
 function isValidYmd(s) {
   return typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
@@ -66,17 +66,25 @@ function cacheSet(key, value, ttlSeconds) {
 const bigquery = new BigQuery({ projectId: BQ_PROJECT });
 
 /**
- * NOVA REGRA:
- * - kpis.sessoes vem do FUNIL (shopify_funnel_daily_final_v)
- * - channels vem de shopify_channels_daily_complete_v (inclui "Não mapeado")
+ * Regras:
+ * - Sessões oficiais: FUNIL (shopify_funnel_daily_final_v)
+ * - Receita/Pedidos: SSOT (ssot_revenue_daily)
+ * - Spend Ads: marketing_spend_campaign_daily_dedup (meta_ads, google_ads)
+ * - WhatsApp: whatsapp_cost_daily_dedup
  */
 const SQL_GESTAO = `
-WITH date_spine AS (
-  SELECT d AS data
-  FROM UNNEST(GENERATE_DATE_ARRAY(@start_date, @end_date)) AS d
+WITH params AS (
+  SELECT
+    CAST(@start_date AS DATE) AS start_date,
+    CAST(@end_date AS DATE) AS end_date
 ),
 
--- Funil diário (base oficial de sessões do dashboard)
+date_spine AS (
+  SELECT d AS data
+  FROM params, UNNEST(GENERATE_DATE_ARRAY(start_date, end_date)) AS d
+),
+
+-- Funil diário (sessões oficiais do painel)
 funnel AS (
   SELECT
     data,
@@ -88,29 +96,116 @@ funnel AS (
     CAST(COALESCE(taxa_conversao, 0) AS FLOAT64) AS taxa_conversao,
     CAST(COALESCE(taxa_conv_checkout, 0) AS FLOAT64) AS taxa_conv_checkout
   FROM \`${BQ_PROJECT}.${BQ_DATASET}.shopify_funnel_daily_final_v\`
-  WHERE data BETWEEN @start_date AND @end_date
+  WHERE data BETWEEN (SELECT start_date FROM params) AND (SELECT end_date FROM params)
 ),
 
--- KPI: receita/pedidos SSOT + sessoes do funil (pra bater com jornada)
+-- SSOT revenue daily
+rev AS (
+  SELECT
+    data,
+    CAST(receita_total AS FLOAT64) AS receita_total,
+    CAST(pedidos_aprovados AS INT64) AS pedidos_aprovados,
+    CAST(clientes_novos AS INT64) AS clientes_novos,
+    CAST(pedidos_novos_por_pedido AS INT64) AS pedidos_novos_por_pedido,
+    CAST(pedidos_recorrentes_por_pedido AS INT64) AS pedidos_recorrentes_por_pedido
+  FROM \`${BQ_PROJECT}.${BQ_DATASET}.ssot_revenue_daily\`
+  WHERE data BETWEEN (SELECT start_date FROM params) AND (SELECT end_date FROM params)
+),
+
+-- Spend Ads por dia e origem (dedup)
+ads_spend_day AS (
+  SELECT
+    data,
+    origem,
+    SUM(IFNULL(CAST(investimento AS FLOAT64), 0)) AS custo
+  FROM \`${BQ_PROJECT}.${BQ_DATASET}.marketing_spend_campaign_daily_dedup\`
+  WHERE data BETWEEN (SELECT start_date FROM params) AND (SELECT end_date FROM params)
+  GROUP BY 1,2
+),
+
+-- WhatsApp cost por dia (dedup)
+wpp_cost_day AS (
+  SELECT
+    data,
+    SUM(IFNULL(CAST(custo AS FLOAT64), 0)) AS custo
+  FROM \`${BQ_PROJECT}.${BQ_DATASET}.whatsapp_cost_daily_dedup\`
+  WHERE data BETWEEN (SELECT start_date FROM params) AND (SELECT end_date FROM params)
+  GROUP BY 1
+),
+
+-- Custo diário por canal de investimento
+marketing_cost_daily_by_channel AS (
+  SELECT
+    data,
+    CASE
+      WHEN origem = 'google_ads' THEN 'Google'
+      WHEN origem = 'meta_ads' THEN 'Meta'
+      ELSE origem
+    END AS canal,
+    custo
+  FROM ads_spend_day
+
+  UNION ALL
+
+  SELECT
+    data,
+    'Whatsapp' AS canal,
+    custo
+  FROM wpp_cost_day
+),
+
+-- Total diário (com spine pra preencher dias sem dado)
+marketing_cost_daily_total AS (
+  SELECT
+    d.data,
+    IFNULL(SUM(m.custo), 0) AS custo_total
+  FROM date_spine d
+  LEFT JOIN marketing_cost_daily_by_channel m
+    ON m.data = d.data
+  GROUP BY 1
+),
+
+-- Total do período
+marketing_cost_period AS (
+  SELECT SUM(custo_total) AS custo_marketing
+  FROM marketing_cost_daily_total
+),
+
+-- Custo por canal no período
+marketing_cost_by_channel AS (
+  SELECT canal, SUM(custo) AS custo
+  FROM marketing_cost_daily_by_channel
+  GROUP BY 1
+),
+
+-- KPI (período)
 kpis AS (
   SELECT
-    SUM(IFNULL(CAST(r.receita_total AS FLOAT64), 0)) AS vendas,
-    SUM(IFNULL(CAST(r.pedidos_aprovados AS INT64), 0)) AS pedidos,
-    SUM(IFNULL(CAST(r.pedidos_novos_por_pedido AS INT64), 0)) AS pedidos_novos,
-    SUM(IFNULL(CAST(r.pedidos_recorrentes_por_pedido AS INT64), 0)) AS pedidos_recorrentes,
-    SUM(IFNULL(CAST(f.sessoes AS INT64), 0)) AS sessoes,
+    SUM(IFNULL(r.receita_total, 0)) AS vendas,
+    SUM(IFNULL(r.pedidos_aprovados, 0)) AS pedidos,
+    SUM(IFNULL(r.pedidos_novos_por_pedido, 0)) AS pedidos_novos,
+    SUM(IFNULL(r.pedidos_recorrentes_por_pedido, 0)) AS pedidos_recorrentes,
+    SUM(IFNULL(r.clientes_novos, 0)) AS clientes_novos,
 
-    SAFE_DIVIDE(
-      SUM(IFNULL(CAST(r.pedidos_aprovados AS INT64), 0)),
-      NULLIF(SUM(IFNULL(CAST(f.sessoes AS INT64), 0)), 0)
-    ) AS taxa_conversao,
+    SUM(IFNULL(f.sessoes, 0)) AS sessoes,
 
-    SAFE_DIVIDE(
-      SUM(IFNULL(CAST(r.receita_total AS FLOAT64), 0)),
-      NULLIF(SUM(IFNULL(CAST(r.pedidos_aprovados AS INT64), 0)), 0)
-    ) AS aov
+    SAFE_DIVIDE(SUM(IFNULL(r.pedidos_aprovados, 0)), NULLIF(SUM(IFNULL(f.sessoes, 0)), 0)) AS taxa_conversao,
+    SAFE_DIVIDE(SUM(IFNULL(r.receita_total, 0)), NULLIF(SUM(IFNULL(r.pedidos_aprovados, 0)), 0)) AS aov,
+
+    (SELECT IFNULL(custo_marketing, 0) FROM marketing_cost_period) AS custo_marketing,
+
+    SAFE_DIVIDE(SUM(IFNULL(r.receita_total, 0)), NULLIF((SELECT custo_marketing FROM marketing_cost_period), 0)) AS roas,
+
+    -- CPS = custo por sessão (mesma ideia do seu merge)
+    SAFE_DIVIDE((SELECT custo_marketing FROM marketing_cost_period), NULLIF(SUM(IFNULL(f.sessoes, 0)), 0)) AS cps,
+
+    -- CAC por cliente novo (cliente)
+    SAFE_DIVIDE((SELECT custo_marketing FROM marketing_cost_period), NULLIF(SUM(IFNULL(r.clientes_novos, 0)), 0)) AS cac_cliente_novo,
+
+    -- CAC por pedido novo (operacional)
+    SAFE_DIVIDE((SELECT custo_marketing FROM marketing_cost_period), NULLIF(SUM(IFNULL(r.pedidos_novos_por_pedido, 0)), 0)) AS cac_pedido_novo
   FROM date_spine d
-  LEFT JOIN \`${BQ_PROJECT}.${BQ_DATASET}.ssot_revenue_daily\` r USING (data)
+  LEFT JOIN rev r USING (data)
   LEFT JOIN funnel f USING (data)
 ),
 
@@ -125,14 +220,74 @@ channels_period AS (
     SAFE_DIVIDE(SUM(CAST(vendas AS FLOAT64)), NULLIF(SUM(CAST(pedidos AS INT64)), 0)) AS aov,
     SUM(CAST(pedidos_novos_clientes AS INT64)) AS pedidos_novos_clientes,
     SUM(CAST(pedidos_clientes_recorrentes AS INT64)) AS pedidos_clientes_recorrentes
-  FROM \`${BQ_PROJECT}.${BQ_DATASET}.shopify_channels_daily_dashboard_v\`
-  WHERE data BETWEEN @start_date AND @end_date
+  FROM \`${BQ_PROJECT}.${BQ_DATASET}.shopify_channels_daily_shopify_attrib_with_shopify_sessions_human_complete_v\`
+  WHERE data BETWEEN (SELECT start_date FROM params) AND (SELECT end_date FROM params)
   GROUP BY canal, tipo
+),
+
+-- Pedidos válidos por hora (BRT)
+orders_by_hour_raw AS (
+  SELECT
+    CAST(hora AS INT64) AS hora,
+    SUM(CAST(pedidos_validos AS INT64)) AS pedidos
+  FROM \`${BQ_PROJECT}.${BQ_DATASET}.shopify_orders_valid_by_hour_v\`
+  WHERE data BETWEEN (SELECT start_date FROM params) AND (SELECT end_date FROM params)
+  GROUP BY 1
+),
+hours_spine AS (
+  SELECT h AS hora
+  FROM UNNEST(GENERATE_ARRAY(0, 23)) AS h
+),
+orders_by_hour AS (
+  SELECT
+    h.hora,
+    IFNULL(o.pedidos, 0) AS pedidos
+  FROM hours_spine h
+  LEFT JOIN orders_by_hour_raw o
+    USING (hora)
+),
+
+-- Atribuição last click (Shopify journey) - focada em marketing (social/search/email)
+marketing_attribution_period AS (
+  SELECT
+    canal,
+    tipo,
+    SUM(CAST(pedidos AS INT64)) AS pedidos,
+    SUM(CAST(vendas AS FLOAT64)) AS vendas
+  FROM \`${BQ_PROJECT}.${BQ_DATASET}.shopify_marketing_attribution_last_click_daily_v\`
+  WHERE data BETWEEN (SELECT start_date FROM params) AND (SELECT end_date FROM params)
+    AND LOWER(tipo) IN ('social', 'search', 'email')
+    AND LOWER(canal) NOT IN ('direct', '(direct)', 'unattributed')
+  GROUP BY 1,2
+),
+marketing_attribution_totals AS (
+  SELECT
+    SUM(pedidos) AS pedidos_total,
+    SUM(vendas) AS vendas_total
+  FROM marketing_attribution_period
+),
+marketing_attribution_top AS (
+  SELECT *
+  FROM marketing_attribution_period
+  ORDER BY pedidos DESC, vendas DESC
+  LIMIT 10
+),
+
+-- Itens vendidos (pedido válido) - top por quantidade
+items_period AS (
+  SELECT
+    sku,
+    ANY_VALUE(item_name) AS item_name,
+    SUM(CAST(units AS INT64)) AS units
+  FROM \`${BQ_PROJECT}.${BQ_DATASET}.shopify_sales_by_model_color_daily_clean_v\`
+  WHERE data BETWEEN (SELECT start_date FROM params) AND (SELECT end_date FROM params)
+  GROUP BY 1
 )
+-- Retorna TODOS os itens do período (o front faz o preview e o "ver todos")
 
 SELECT
-  FORMAT_DATE('%F', @start_date) AS start,
-  FORMAT_DATE('%F', @end_date) AS end_date,
+  FORMAT_DATE('%F', (SELECT start_date FROM params)) AS start,
+  FORMAT_DATE('%F', (SELECT end_date FROM params)) AS end_date,
   'America/Sao_Paulo' AS timezone,
 
   (SELECT AS STRUCT * FROM kpis) AS kpis,
@@ -150,6 +305,25 @@ SELECT
   ) FROM funnel) AS funnel_daily,
 
   (SELECT ARRAY_AGG(STRUCT(
+      FORMAT_DATE('%F', data) AS data,
+      custo_total
+    ) ORDER BY data
+  ) FROM marketing_cost_daily_total) AS marketing_cost_daily,
+
+  (SELECT ARRAY_AGG(STRUCT(
+      FORMAT_DATE('%F', data) AS data,
+      canal,
+      custo
+    ) ORDER BY data, canal
+  ) FROM marketing_cost_daily_by_channel) AS marketing_cost_daily_by_channel,
+
+  (SELECT ARRAY_AGG(STRUCT(
+      canal,
+      custo
+    ) ORDER BY custo DESC
+  ) FROM marketing_cost_by_channel) AS marketing_cost_by_channel,
+
+  (SELECT ARRAY_AGG(STRUCT(
       canal,
       tipo,
       sessoes,
@@ -161,6 +335,33 @@ SELECT
       pedidos_clientes_recorrentes
     ) ORDER BY vendas DESC
   ) FROM channels_period) AS channels
+
+  , (SELECT ARRAY_AGG(STRUCT(
+      LPAD(CAST(hora AS STRING), 2, '0') AS hour,
+      pedidos
+    ) ORDER BY hora
+  ) FROM orders_by_hour) AS orders_valid_by_hour
+
+  , (SELECT AS STRUCT
+      IFNULL(pedidos_total, 0) AS orders,
+      IFNULL(vendas_total, 0) AS revenue
+    FROM marketing_attribution_totals
+  ) AS marketing_attribution_totals
+
+  , (SELECT ARRAY_AGG(STRUCT(
+      canal,
+      tipo,
+      pedidos,
+      vendas
+    ) ORDER BY pedidos DESC, vendas DESC
+  ) FROM marketing_attribution_top) AS marketing_attribution
+
+  , (SELECT ARRAY_AGG(STRUCT(
+      sku,
+      item_name,
+      units
+    ) ORDER BY units DESC, sku
+  ) FROM items_period) AS top_items_sold
 ;`;
 
 async function runBqQuery(sql, params) {
@@ -177,7 +378,6 @@ async function runBqQuery(sql, params) {
 async function main() {
   const app = Fastify({ logger: true, trustProxy: true });
 
-  // CORS
   const allow = (process.env.CORS_ALLOW_ORIGINS || '').trim();
   const allowList = allow ? allow.split(',').map((s) => s.trim()).filter(Boolean) : null;
 
@@ -198,10 +398,12 @@ async function main() {
     bq_project: BQ_PROJECT,
     bq_dataset: BQ_DATASET,
     bq_location: BQ_LOCATION,
+    revision: process.env.K_REVISION || 'local',
+    service_name: process.env.K_SERVICE || 'local',
   }));
 
   app.get('/v1/shopify/gestao', async (req, reply) => {
-    const { start, end } = req.query || {};
+    const { start, end, bust } = req.query || {};
 
     if (!isValidYmd(start) || !isValidYmd(end)) {
       reply.code(400);
@@ -223,16 +425,21 @@ async function main() {
     const ttl = closed ? TTL_CLOSED_SECONDS : TTL_INTRADAY_SECONDS;
 
     const key = makeCacheKey(req.routerPath, req.query);
-    const cached = cacheGet(key);
-    if (cached) {
-      reply.header('Cache-Control', `public, max-age=${ttl}`);
-      return cached;
+
+    // bust=1 força bypass de cache (útil pra validação)
+    if (!bust) {
+      const cached = cacheGet(key);
+      if (cached) {
+        reply.header('Cache-Control', `public, max-age=${ttl}`);
+        return cached;
+      }
     }
 
     const rows = await runBqQuery(SQL_GESTAO, { start_date: start, end_date: end });
     const out = rows && rows[0] ? rows[0] : null;
 
-    cacheSet(key, out, ttl);
+    if (!bust) cacheSet(key, out, ttl);
+
     reply.header('Cache-Control', `public, max-age=${ttl}`);
     return out;
   });
